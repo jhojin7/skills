@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reliable launchd"
+  short_description: "Create and verify resilient macOS launchd jobs"
+  default_prompt: "Use $launchd to create and verify a macOS launchd job safely."
