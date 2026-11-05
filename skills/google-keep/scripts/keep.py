@@ -540,6 +540,8 @@ def menu_click(label: str) -> None:
 def cmd_delete(args: argparse.Namespace) -> dict:
     target = args.note
     open_note(target)
+    if not args.forever and eval_js('JSON.stringify(document.body.innerText.includes("Note in Trash"))'):
+        return {"ok": True, "id": target, "trashed": True, "forever": False}
     data = fields()
     root_js = r"""
 (() => {
