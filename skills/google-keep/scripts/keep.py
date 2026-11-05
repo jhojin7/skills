@@ -12,6 +12,8 @@ import os
 import shutil
 import subprocess
 import sys
+import re
+import time
 from pathlib import Path
 
 HOME = "https://keep.google.com/u/0/"
@@ -26,9 +28,9 @@ CARD_JS = r"""
   const cards = [...document.querySelectorAll(".IZ65Hb-n0tgWb")];
   const out = [];
   const seen = new Set();
-  for (const card of cards) {
+  for (const [index, card] of cards.entries()) {
     const r = card.getBoundingClientRect();
-    if (r.width < 180 || r.width > 1400 || r.height < 24 || r.height > 6000) continue;
+    if (r.width < 180 || r.width > 1400 || r.height < 24) continue;
     const raw = (card.innerText || "").replace(/\u00a0/g, " ").replace(/\u202f/g, " ");
     const lines = raw.split(/\n+/).map(s => s.trim()).filter(Boolean);
     const edited = (lines.find(s => s.startsWith("Edited ")) || "");
@@ -36,11 +38,13 @@ CARD_JS = r"""
     if (!body.length) continue;
     const title = body[0];
     const text = body.slice(1).join("\n").slice(0, 4000);
-    const key = title + "\n" + text.slice(0, 160);
+    const key = String(index);
+    card.setAttribute("data-keep-token", key);
     if (seen.has(key)) continue;
     seen.add(key);
     const links = [...new Set([...card.querySelectorAll("a[href]")].map(a => a.href).filter(h => h && !h.startsWith("javascript:")))].slice(0, 8);
     out.push({
+      token: key,
       y: Math.round(r.y + window.scrollY),
       h: Math.round(r.height),
       pinned: !!card.querySelector('[aria-label="Unpin"]'),
@@ -63,10 +67,10 @@ FIELDS_JS = r"""
   };
   const box = (el) => {
     const r = el.getBoundingClientRect();
-    return {x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: (el.innerText || "").slice(0, 500)};
+    return {x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: el.children.length && [...el.children].every(n => n.tagName === "P") ? [...el.children].map(n => n.innerText === "\n" ? "" : n.innerText).join("\n") : (el.innerText === "\n" ? "" : (el.innerText || ""))};
   };
   const title = [...document.querySelectorAll('[contenteditable="true"]')].find(el => vis(el) && (el.getAttribute("aria-label") === "Title" || el.getAttribute("role") === "textbox"));
-  const body = [...document.querySelectorAll('div[role="combobox"][contenteditable="true"]')].find(vis);
+  const body = [...document.querySelectorAll('div[role="combobox"]')].find(vis);
   const take = [...document.querySelectorAll('div[role="combobox"]')].filter(vis).sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y)[0];
   const close = [...document.querySelectorAll('[role="button"]')].filter(el => vis(el) && (el.innerText || "").trim() === "Close").sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y)[0];
   return JSON.stringify({
@@ -174,7 +178,10 @@ def run(args: list[str], stdin: str | None = None) -> str:
         "--profile", profile_dir(),
         *args,
     ]
-    proc = subprocess.run(cmd, input=stdin, text=True, capture_output=True)
+    try:
+        proc = subprocess.run(cmd, input=stdin, text=True, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        raise KeepError("Browser command timed out. A write may have completed; inspect the note before retrying.") from exc
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise KeepError(detail[-2000:] or f"agent-browser failed: {args[0]}")
@@ -237,12 +244,32 @@ def ensure_list_view() -> None:
         run(["wait", "500"])
 
 
+def wait_ready(note: str | None = None) -> None:
+    run(["wait", "1500"])
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        state = eval_js("""JSON.stringify({url:location.href,ready:document.readyState,
+          title:!!document.querySelector('[aria-label="Title"][contenteditable="true"]'),
+          cards:document.querySelectorAll('.IZ65Hb-n0tgWb').length,
+          empty:/0 search results|Notes you add appear here|No matching results|No results|No notes|Your archived notes|No notes in Trash/i.test(document.body.innerText),
+          busy:!!document.querySelector('[role="progressbar"]')})""")
+        if "accounts.google.com" in state['url']:
+            raise KeepError("Sign in to Keep in Chrome before using this skill.")
+        if state['ready'] == 'complete' and not state['busy']:
+            if note and note_id(state['url']) == note and state['title']:
+                return
+            if not note and (state['cards'] > 1 or state['empty']):
+                return
+        run(['wait', '300'])
+    raise KeepError("Keep did not become ready within 30 seconds. Inspect state before retrying a write.")
+
+
 def goto_home() -> None:
     ensure()
-    eval_js(
-        '(() => { location.assign("https://keep.google.com/u/0/"); return JSON.stringify({ok:true}); })()'
-    )
-    run(["wait", "1000"])
+    if fields().get("close"):
+        close_composer()
+    click_tab("Notes")
+    wait_ready()
     scroll_top()
 
 
@@ -255,20 +282,12 @@ def apply_query(query: str) -> None:
         + ")); return JSON.stringify({ok:true}); })()"
     )
     eval_js(js)
-    run(["wait", "1200"])
+    wait_ready()
 
 
 def click_tab(label: str) -> None:
-    js = (
-        "(() => { const want = "
-        + json.dumps(label)
-        + "; const tab = [...document.querySelectorAll('[role=tab]')].find(el => (el.getAttribute('aria-label') || el.innerText || '').trim() === want);"
-        + " if (!tab) return JSON.stringify({ok:false}); tab.click(); return JSON.stringify({ok:true}); })()"
-    )
-    found = eval_js(js)
-    if not found.get("ok"):
-        raise KeepError(f"No Keep tab named {label!r}. Run filters to see labels.")
-    run(["wait", "900"])
+    run(['click', '[role="tab"][aria-label=' + json.dumps(label) + ']'])
+    run(['wait', '500'])
 
 
 def apply_type(name: str) -> None:
@@ -288,6 +307,20 @@ def apply_type(name: str) -> None:
         raise KeepError(f"Search chip {name!r} was not visible.")
     mouse(hit["x"], hit["y"])
     run(["wait", "800"])
+
+
+def read_card(token: str) -> dict:
+    selector = '[data-keep-token=' + json.dumps(token) + ']'
+    run(['scrollintoview', selector])
+    run(['click', selector])
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        data = read_open()
+        if data['id']:
+            close_composer()
+            return data
+        run(['wait', '200'])
+    raise KeepError("Card did not resolve to a note ID.")
 
 
 def collect() -> list[dict]:
@@ -318,12 +351,7 @@ def type_at(x: int, y: int, text: str, replace: bool) -> None:
     if text == "":
         cmds.append(["press", "Backspace"])
     else:
-        lines = text.split("\n")
-        for i, line in enumerate(lines):
-            if i:
-                cmds.append(["press", "Enter"])
-            if line:
-                cmds.append(["keyboard", "inserttext", line])
+        cmds.append(["keyboard", "inserttext", text])
     batch(cmds)
 
 
@@ -342,9 +370,12 @@ def note_id(url: str) -> str:
 
 
 def open_note(note: str) -> None:
-    ensure()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", note):
+        raise KeepError("Invalid note ID.")
     run(["open", HOME + "#NOTE/" + note])
-    run(["wait", "900"])
+    wait_ready(note)
+    if read_open()["id"] != note:
+        raise KeepError("The requested note did not open.")
 
 
 def close_composer() -> None:
@@ -382,11 +413,14 @@ def read_open() -> dict:
 
 
 def cmd_list(args: argparse.Namespace) -> dict:
+    if args.limit < 1:
+        raise KeepError("--limit must be positive.")
     chosen = [args.label, args.type, None if args.view == "notes" else args.view]
+    if sum(bool(value) for value in chosen) > 1:
+        raise KeepError("Use one of --label, --type, or a nondefault --view per call.")
     if args.query and any(chosen):
         raise KeepError("Combine repeated --query values with each other only. Run label, type, or view as a separate command.")
-    ensure()
-    scroll_top()
+    goto_home()
     ensure_list_view()
     if args.view != "notes":
         click_tab(VIEW_TABS[args.view])
@@ -402,7 +436,9 @@ def cmd_list(args: argparse.Namespace) -> dict:
             apply_query(query)
             ensure_list_view()
             for note in collect():
-                key = (note["title"], note.get("text", "")[:160])
+                opened = read_card(note.pop("token"))
+                note.update(id=opened['id'], title=opened['title'], text=opened['body'])
+                key = note['id']
                 if key in seen:
                     continue
                 seen.add(key)
@@ -413,7 +449,12 @@ def cmd_list(args: argparse.Namespace) -> dict:
         notes = collect()
         if not args.all and args.view == "notes":
             notes = [note for note in notes if not note.get("pinned")]
-    return {"ok": True, "count": min(len(notes), args.limit), "notes": notes[: args.limit]}
+    notes = notes[:args.limit]
+    for note in notes:
+        if 'token' in note:
+            opened = read_card(note.pop('token'))
+            note.update(id=opened['id'], title=opened['title'], text=opened['body'])
+    return {"ok": True, "count": len(notes), "notes": notes}
 
 
 def cmd_filters(_: argparse.Namespace) -> dict:
@@ -431,56 +472,35 @@ def cmd_filters(_: argparse.Namespace) -> dict:
 
 
 def cmd_get(args: argparse.Namespace) -> dict:
-    if args.note:
-        open_note(args.note)
-        return {"ok": True, "note": read_open()}
-    if not args.title:
-        raise KeepError("Pass a note id or --title.")
-    result = cmd_list(argparse.Namespace(query=[args.title], label=None, type=None, view="notes", limit=20, all=True))
-    matches = [note for note in result["notes"] if note["title"] == args.title]
-    if args.body:
-        matches = [note for note in matches if args.body in note.get("text", "")]
-    if len(matches) != 1:
-        raise KeepError(f"Expected one note titled {args.title!r}, found {len(matches)}.")
-    js = (
-        "(() => { const want = "
-        + json.dumps(args.title)
-        + "; const card = [...document.querySelectorAll('.IZ65Hb-n0tgWb')].find(el => (el.innerText || '').trim().startsWith(want) && el.getBoundingClientRect().height > 24 && el.getBoundingClientRect().height < 6000);"
-        + " if (!card) return JSON.stringify({ok:false}); card.click(); return JSON.stringify({ok:true}); })()"
-    )
-    opened = eval_js(js)
-    if not opened.get("ok"):
-        raise KeepError("The matching card was not clickable.")
-    run(["wait", "800"])
+    open_note(args.note)
     return {"ok": True, "note": read_open()}
 
 
 def cmd_create(args: argparse.Namespace) -> dict:
+    if not args.title and not args.body:
+        raise KeepError("Pass a nonempty --title or --body.")
+    query = args.title or args.body.splitlines()[0]
+    search = argparse.Namespace(query=[query], label=None, type=None, view="notes", limit=10000, all=True)
+    before = {n['id'] for n in cmd_list(search)['notes']}
     data = open_composer()
     if args.title:
-        type_at(data["title"]["x"], data["title"]["y"], args.title, replace=False)
+        type_at(data['title']['x'], data['title']['y'], args.title, replace=False)
     if args.body:
-        latest = fields()
-        body = latest.get("body") or data.get("body")
-        if not body:
-            raise KeepError("The note body field was not editable.")
-        type_at(body["x"], body["y"], args.body, replace=False)
+        body = fields()['body']
+        type_at(body['x'], body['y'], args.body, replace=False)
     close_composer()
-    run(["wait", "600"])
-    found = cmd_get(argparse.Namespace(note=None, title=args.title or args.body, body=args.body if args.title else None))
-    return {"ok": True, "note": found["note"]}
+    after = cmd_list(search)['notes']
+    created = [n for n in after if n['id'] not in before and n['title'] == args.title and n['text'] == args.body]
+    if len(created) != 1:
+        raise KeepError("Note may have been saved, but its new ID could not be resolved. Inspect list before retrying creation.")
+    open_note(created[0]['id'])
+    return {"ok": True, "note": read_open()}
 
 
 def cmd_update(args: argparse.Namespace) -> dict:
     if args.title is None and args.body is None:
         raise KeepError("Pass --title or --body.")
     target = args.note
-    if not target:
-        if not args.match_title:
-            raise KeepError("Pass a note id or --match-title.")
-        target = cmd_get(argparse.Namespace(note=None, title=args.match_title, body=None))["note"]["id"]
-    if not target:
-        raise KeepError("The note id was not on the Keep URL.")
     open_note(target)
     data = fields()
     if args.title is not None:
@@ -514,19 +534,7 @@ def menu_click(label: str) -> None:
 
 def cmd_delete(args: argparse.Namespace) -> dict:
     target = args.note
-    title = args.title
-    if not target:
-        if not title:
-            raise KeepError("Pass a note id or --title.")
-        got = cmd_get(argparse.Namespace(note=None, title=title, body=args.body))
-        target = got["note"]["id"]
-        title = got["note"]["title"]
-        body = got["note"]["body"]
-    else:
-        open_note(target)
-        current = read_open()
-        title = current["title"]
-        body = current["body"]
+    open_note(target)
     data = fields()
     root_js = r"""
 (() => {
@@ -554,18 +562,7 @@ def cmd_delete(args: argparse.Namespace) -> dict:
     result = {"ok": True, "id": target, "trashed": True, "forever": False}
     if not args.forever:
         return result
-    click_tab("Trash")
-    collapsed = (title + " " + body).strip()
-    js = (
-        "(() => { const want = "
-        + json.dumps(collapsed)
-        + "; const card = [...document.querySelectorAll('div')].find(el => (el.innerText || '').replace(/\\s+/g, ' ').trim() === want && el.getBoundingClientRect().width > 160 && el.getBoundingClientRect().height > 24 && el.getBoundingClientRect().height < 220);"
-        + " if (!card) return JSON.stringify({ok:false}); card.click(); return JSON.stringify({ok:true}); })()"
-    )
-    opened = eval_js(js)
-    if not opened.get("ok"):
-        raise KeepError("The note was trashed but its Trash card was not found.")
-    run(["wait", "700"])
+    open_note(target)
     forever = eval_js(
         r"""
 (() => {
@@ -627,10 +624,8 @@ def build_parser() -> argparse.ArgumentParser:
     filters = sub.add_parser("filters", help="List views, labels, and type chips.")
     filters.set_defaults(func=cmd_filters)
 
-    get = sub.add_parser("get", help="Open one note by id or exact title.")
-    get.add_argument("note", nargs="?")
-    get.add_argument("--title")
-    get.add_argument("--body", help="Disambiguate an exact title.")
+    get = sub.add_parser("get", help="Open one note by ID.")
+    get.add_argument("note")
     get.set_defaults(func=cmd_get)
 
     create = sub.add_parser("create", help="Create a note and return its id.")
@@ -639,16 +634,13 @@ def build_parser() -> argparse.ArgumentParser:
     create.set_defaults(func=cmd_create)
 
     update = sub.add_parser("update", help="Replace a note title or body.")
-    update.add_argument("note", nargs="?")
+    update.add_argument("note")
     update.add_argument("--title")
     update.add_argument("--body")
-    update.add_argument("--match-title", help="Resolve this exact title when no id is given.")
     update.set_defaults(func=cmd_update)
 
     delete = sub.add_parser("delete", help="Move a note to Trash. --forever removes it.")
-    delete.add_argument("note", nargs="?")
-    delete.add_argument("--title")
-    delete.add_argument("--body")
+    delete.add_argument("note")
     delete.add_argument("--forever", action="store_true")
     delete.set_defaults(func=cmd_delete)
 
@@ -662,7 +654,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         emit(args.func(args))
-    except KeepError as exc:
+    except (KeepError, OSError, ValueError) as exc:
         emit({"ok": False, "error": str(exc)}, code=1)
 
 
