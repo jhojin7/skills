@@ -63,16 +63,18 @@ FIELDS_JS = r"""
 (() => {
   const vis = (el) => {
     const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0;
+    if (r.width <= 0 || r.height <= 0 || r.bottom <= 0 || r.top >= innerHeight) return false;
+    const hit = document.elementFromPoint(Math.max(0,r.left)+Math.min(10,r.width/2),Math.max(0,r.top)+Math.min(10,r.height/2));
+    return !!hit && (el === hit || el.contains(hit));
   };
   const box = (el) => {
     const r = el.getBoundingClientRect();
     return {x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: el.children.length && [...el.children].every(n => n.tagName === "P") ? [...el.children].map(n => n.innerText === "\n" ? "" : n.innerText).join("\n") : (el.innerText === "\n" ? "" : (el.innerText || ""))};
   };
-  const title = [...document.querySelectorAll('[contenteditable="true"]')].find(el => vis(el) && (el.getAttribute("aria-label") === "Title" || el.getAttribute("role") === "textbox"));
-  const body = [...document.querySelectorAll('div[role="combobox"]')].find(vis);
+  const title = [...document.querySelectorAll('[contenteditable="true"]')].findLast(el => vis(el) && (el.getAttribute("aria-label") === "Title" || el.getAttribute("role") === "textbox"));
+  const body = [...document.querySelectorAll('div[role="combobox"]')].findLast(vis);
   const take = [...document.querySelectorAll('div[role="combobox"]')].filter(vis).sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y)[0];
-  const close = [...document.querySelectorAll('[role="button"]')].filter(el => vis(el) && (el.innerText || "").trim() === "Close").sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y)[0];
+  const close = [...document.querySelectorAll('[role="button"]')].filter(el => vis(el) && (el.innerText || "").trim() === "Close").at(-1);
   return JSON.stringify({
     url: location.href,
     title: title ? box(title) : null,
@@ -256,7 +258,7 @@ def wait_ready(note: str | None = None) -> None:
         if "accounts.google.com" in state['url']:
             raise KeepError("Sign in to Keep in Chrome before using this skill.")
         if state['ready'] == 'complete' and not state['busy']:
-            if note and note_id(state['url']) == note and state['title']:
+            if note and note_id(state['url']) == note and fields().get('title') and fields().get('close'):
                 return
             if not note and (state['cards'] > 1 or state['empty']):
                 return
@@ -546,7 +548,7 @@ def cmd_delete(args: argparse.Namespace) -> dict:
     root_js = r"""
 (() => {
   const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-  const body = [...document.querySelectorAll('[contenteditable="true"]')].find(el => vis(el) && el.getAttribute("role") === "combobox");
+  const body = [...document.querySelectorAll('div[role="combobox"]')].findLast(vis);
   if (!body) return JSON.stringify({ok:false, step:"body"});
   let root = body;
   for (let i = 0; i < 14 && root.parentElement; i++) {
@@ -555,6 +557,8 @@ def cmd_delete(args: argparse.Namespace) -> dict:
   }
   const more = [...root.querySelectorAll('[aria-label="More"]')].filter(vis).sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y)[0];
   if (!more) return JSON.stringify({ok:false, step:"more"});
+  document.querySelectorAll("[data-keep-more]").forEach(e=>e.removeAttribute("data-keep-more"));
+  more.setAttribute("data-keep-more","true");
   more.scrollIntoView({block:"center"});
   const r = more.getBoundingClientRect();
   return JSON.stringify({ok:true, x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)});
@@ -565,7 +569,8 @@ def cmd_delete(args: argparse.Namespace) -> dict:
     more = eval_js(root_js)
     if not more.get("ok"):
         raise KeepError(f"Could not find More on the open note ({more}).")
-    mouse(more["x"], more["y"], "350")
+    run(["click", '[data-keep-more="true"]'])
+    run(["wait", "500"])
     menu_click("Delete note")
     result = {"ok": True, "id": target, "trashed": True, "forever": False}
     if not args.forever:
