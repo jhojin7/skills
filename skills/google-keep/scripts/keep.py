@@ -527,6 +527,11 @@ def menu_click(label: str) -> None:
         + " const r = item.getBoundingClientRect(); return JSON.stringify({ok:true, x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)}); })()"
     )
     hit = eval_js(js)
+    for _ in range(5):
+        if hit.get("ok"):
+            break
+        run(["wait", "300"])
+        hit = eval_js(js)
     if not hit.get("ok"):
         raise KeepError(f"Menu item {label!r} was not visible. Saw {hit.get('labels')}.")
     mouse(hit["x"], hit["y"], "500")
@@ -548,6 +553,7 @@ def cmd_delete(args: argparse.Namespace) -> dict:
   }
   const more = [...root.querySelectorAll('[aria-label="More"]')].filter(vis).sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y)[0];
   if (!more) return JSON.stringify({ok:false, step:"more"});
+  more.scrollIntoView({block:"center"});
   const r = more.getBoundingClientRect();
   return JSON.stringify({ok:true, x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)});
 })()
